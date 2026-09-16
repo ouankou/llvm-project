@@ -2485,13 +2485,13 @@ void CodeGenFunction::EmitOMPInnerLoop(
   // Start the loop with a block that tests the condition.
   auto CondBlock = createBasicBlock("omp.inner.for.cond");
   EmitBlock(CondBlock);
-  const SourceRange R = S.getSourceRange();
 
   // If attributes are attached, push to the basic block with them.
   const auto &OMPED = cast<OMPExecutableDirective>(S);
   const CapturedStmt *ICS = OMPED.getInnermostCapturedStmt();
   const Stmt *SS = ICS->getCapturedStmt();
   const AttributedStmt *AS = dyn_cast_or_null<AttributedStmt>(SS);
+  const SourceRange R = SS->IgnoreContainers()->getSourceRange();
   OMPLoopNestStack.clear();
   if (AS)
     LoopStack.push(CondBlock, CGM.getContext(), CGM.getCodeGenOpts(),
