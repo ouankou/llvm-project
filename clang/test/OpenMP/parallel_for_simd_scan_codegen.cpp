@@ -18,24 +18,28 @@ void baz(int n) {
   static float a[10];
   static double b;
 
-  // CHECK: call ptr @llvm.stacksave.p0()
   // CHECK: [[A_BUF_SIZE:%.+]] = mul nuw i64 10, [[NUM_ELEMS:%[^,]+]]
+  // CHECK: [[A_BUF_BYTES:%.+]] = mul nuw i64 [[A_BUF_SIZE]], 4
 
   // float a_buffer[10][n];
-  // CHECK: [[A_BUF:%.+]] = alloca float, i64 [[A_BUF_SIZE]],
-  // CHECK: [[B_BUF:%.+]] = alloca double, i64 10,
+  // CHECK: [[A_BUF:%.+]] = call ptr @__kmpc_aligned_alloc(i32 [[GTID:%.+]], i64 16, i64 [[A_BUF_BYTES]], ptr null)
+  // CHECK: [[B_BUF:%.+]] = call ptr @__kmpc_aligned_alloc(i32 [[GTID]], i64 16, i64 80, ptr null)
 
   // CHECK: call void (ptr, i32, ptr, ...) @__kmpc_fork_call(
+  // CHECK: call void @__kmpc_free(i32 [[GTID]], ptr [[A_BUF]], ptr null)
+  // CHECK: call void @__kmpc_free(i32 [[GTID]], ptr [[B_BUF]], ptr null)
 
   // CHECK: [[A_BUF_SIZE:%.+]] = mul nuw i64 10, [[NUM_ELEMS:%[^,]+]]
+  // CHECK: [[A_BUF_BYTES:%.+]] = mul nuw i64 [[A_BUF_SIZE]], 4
 
   // float a_buffer[10][n];
-  // CHECK: [[A_BUF:%.+]] = alloca float, i64 [[A_BUF_SIZE]],
+  // CHECK: [[A_BUF:%.+]] = call ptr @__kmpc_aligned_alloc(i32 [[GTID]], i64 16, i64 [[A_BUF_BYTES]], ptr null)
 
   // double b_buffer[10];
-  // CHECK: [[B_BUF:%.+]] = alloca double, i64 10,
+  // CHECK: [[B_BUF:%.+]] = call ptr @__kmpc_aligned_alloc(i32 [[GTID]], i64 16, i64 80, ptr null)
   // CHECK: call void (ptr, i32, ptr, ...) @__kmpc_fork_call(
-  // CHECK: call void @llvm.stackrestore.p0(ptr
+  // CHECK: call void @__kmpc_free(i32 [[GTID]], ptr [[A_BUF]], ptr null)
+  // CHECK: call void @__kmpc_free(i32 [[GTID]], ptr [[B_BUF]], ptr null)
 
 #pragma omp parallel for simd reduction(inscan, +:a[:n], b)
   for (int i = 0; i < 10; ++i) {

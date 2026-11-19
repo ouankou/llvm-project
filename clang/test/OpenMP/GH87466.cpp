@@ -142,12 +142,14 @@ void for_simd_in_parallel() {
 // CHECK: call void @__kmpc_free(
 // CHECK: ret void
 
-// Combined directive: the buffer is allocated before the parallel region.
+// Combined directive: the buffer is allocated on the heap before the parallel
+// region and freed after it.
 // CHECK-LABEL: define {{.*}}void @_Z8combinedi(
-// CHECK: [[BUF:%.+]] = alloca i32, i64 %
+// CHECK: [[BUF:%.+]] = call ptr @__kmpc_aligned_alloc(i32 [[GTID:%.+]], i64 {{[0-9]+}}, i64 %{{.+}}, ptr null)
 // CHECK: call void {{.*}}@__kmpc_fork_call(ptr @{{.+}}, i32 {{[0-9]+}}, ptr [[OUTLINED_COMB:@[^,]+]],
 // CHECK: getelementptr inbounds nuw i32, ptr [[BUF]], i64 %
 // CHECK: store i32 %{{.+}}, ptr %curr_scan,
+// CHECK: call void @__kmpc_free(i32 [[GTID]], ptr [[BUF]], ptr null)
 // CHECK: ret void
 void combined(int n) {
   int curr_scan = 0;

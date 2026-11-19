@@ -4398,6 +4398,42 @@ static void emitScanBasedDirectiveDecls(
   }
 }
 
+/// Allocates the temp array \p TempVD of an inscan reduction with
+/// __kmpc_aligned_alloc and runs its initializer, if any.
+static Address emitScanTempArrayAlloc(CodeGenFunction &CGF,
+                                      const OMPLoopDirective &S,
+                                      const VarDecl *TempVD) {
+  QualType Ty = TempVD->getType();
+  CharUnits Align = CGF.getContext().getDeclAlign(TempVD);
+  llvm::Value *Ptr = CGF.CGM.getOpenMPRuntime().emitAllocCall(
+      CGF, S.getBeginLoc(), CGF.getTypeSize(Ty), Align);
+  Address Addr(Ptr, CGF.ConvertTypeForMem(Ty), Align);
+  const Expr *Init = TempVD->getInit();
+  if (Init && !CGF.isTrivialInitializer(Init))
+    CGF.EmitExprAsInit(Init, TempVD,
+                       CGF.MakeAddrLValue(Addr, Ty, AlignmentSource::Decl),
+                       /*capturedByInit=*/false);
+  return Addr;
+}
+
+/// Destroys and frees the temp arrays of the inscan reductions of \p S
+/// allocated with emitScanTempArrayAlloc.
+static void emitScanTempArraysFree(CodeGenFunction &CGF,
+                                   const OMPLoopDirective &S) {
+  for (const auto *C : S.getClausesOfKind<OMPReductionClause>()) {
+    for (const Expr *E : C->copy_array_temps()) {
+      const auto *TempVD = cast<VarDecl>(cast<DeclRefExpr>(E)->getDecl());
+      QualType Ty = TempVD->getType();
+      Address Addr = CGF.GetAddrOfLocalVar(TempVD);
+      if (QualType::DestructionKind DtorKind = Ty.isDestructedType())
+        CGF.emitDestroy(Addr, Ty, CGF.getDestroyer(DtorKind),
+                        /*useEHCleanupForArray=*/false);
+      CGF.CGM.getOpenMPRuntime().emitFreeCall(CGF, S.getBeginLoc(),
+                                              Addr.emitRawPointer(CGF));
+    }
+  }
+}
+
 /// Emits internal temp array declarations for the directive with inscan
 /// reductions that is not combined with 'parallel'. All threads of the team
 /// execute the directive, so the arrays are allocated by one thread and shared
@@ -4433,19 +4469,8 @@ static Address emitScanBasedDirectiveSharedDecls(
                      DidIt](CodeGenFunction &CGF, PrePostActionTy &Action) {
     Action.Enter(CGF);
     for (unsigned I = 0, E = TempVDs.size(); I < E; ++I) {
-      const VarDecl *TempVD = TempVDs[I];
-      QualType Ty = TempVD->getType();
-      CharUnits Align = CGF.getContext().getDeclAlign(TempVD);
-      llvm::Value *Ptr = CGF.CGM.getOpenMPRuntime().emitAllocCall(
-          CGF, S.getBeginLoc(), CGF.getTypeSize(Ty), Align);
-      CGF.Builder.CreateStore(Ptr, TempPtrAddrs[I]);
-      const Expr *Init = TempVD->getInit();
-      if (Init && !CGF.isTrivialInitializer(Init))
-        CGF.EmitExprAsInit(
-            Init, TempVD,
-            CGF.MakeAddrLValue(Address(Ptr, CGF.ConvertTypeForMem(Ty), Align),
-                               Ty, AlignmentSource::Decl),
-            /*capturedByInit=*/false);
+      Address Addr = emitScanTempArrayAlloc(CGF, S, TempVDs[I]);
+      CGF.Builder.CreateStore(Addr.emitRawPointer(CGF), TempPtrAddrs[I]);
     }
     CGF.Builder.CreateStore(CGF.Builder.getInt32(1), DidIt);
   };
@@ -4484,19 +4509,35 @@ static void emitScanBasedDirectiveSharedDeclsFree(CodeGenFunction &CGF,
       CGF.Builder.CreateIsNotNull(CGF.Builder.CreateLoad(DidIt));
   CGF.Builder.CreateCondBr(DidItVal, ThenBB, ExitBB);
   CGF.EmitBlock(ThenBB);
-  for (const auto *C : S.getClausesOfKind<OMPReductionClause>()) {
-    for (const Expr *E : C->copy_array_temps()) {
-      const auto *TempVD = cast<VarDecl>(cast<DeclRefExpr>(E)->getDecl());
-      QualType Ty = TempVD->getType();
-      Address Addr = CGF.GetAddrOfLocalVar(TempVD);
-      if (QualType::DestructionKind DtorKind = Ty.isDestructedType())
-        CGF.emitDestroy(Addr, Ty, CGF.getDestroyer(DtorKind),
-                        /*useEHCleanupForArray=*/false);
-      CGF.CGM.getOpenMPRuntime().emitFreeCall(CGF, S.getBeginLoc(),
-                                              Addr.emitRawPointer(CGF));
-    }
-  }
+  emitScanTempArraysFree(CGF, S);
   CGF.EmitBlock(ExitBB);
+}
+
+/// Emits internal temp array declarations for the directive with inscan
+/// reductions combined with 'parallel'. The arrays hold an element per
+/// iteration, so the encountering thread allocates them on the heap rather
+/// than on its stack; they are mapped in \p TempsScope.
+/// The code is the following:
+/// \code
+/// size num_iters = <num_iters>;
+/// <type> *buffer = __kmpc_aligned_alloc(num_iters * sizeof(<type>));
+/// \endcode
+/// \returns false if the arrays are emitted on the stack instead, as the device
+/// runtime has no __kmpc_aligned_alloc or __kmpc_free.
+static bool emitScanBasedDirectiveParallelDecls(
+    CodeGenFunction &CGF, const OMPLoopDirective &S,
+    llvm::function_ref<llvm::Value *(CodeGenFunction &)> NumIteratorsGen,
+    CodeGenFunction::OMPPrivateScope &TempsScope) {
+  if (CGF.CGM.getLangOpts().OpenMPIsTargetDevice) {
+    emitScanBasedDirectiveDecls(CGF, S, NumIteratorsGen);
+    return false;
+  }
+  SmallVector<const VarDecl *, 4> TempVDs;
+  emitScanBasedDirectiveDecls(CGF, S, NumIteratorsGen, &TempVDs);
+  for (const VarDecl *TempVD : TempVDs)
+    TempsScope.addPrivate(TempVD, emitScanTempArrayAlloc(CGF, S, TempVD));
+  (void)TempsScope.Privatize();
+  return true;
 }
 
 /// Copies final inscan reductions values to the original variables.
@@ -5419,14 +5460,17 @@ void CodeGenFunction::EmitOMPParallelForDirective(
       return CGF.EmitScalarExpr(S.getNumIterations());
     };
     bool IsInscan = hasInscanReduction(S);
-    if (IsInscan)
-      emitScanBasedDirectiveDecls(*this, S, NumIteratorsGen);
+    OMPPrivateScope TempsScope(*this);
+    bool TempsOnHeap = IsInscan && emitScanBasedDirectiveParallelDecls(
+                                       *this, S, NumIteratorsGen, TempsScope);
     auto LPCRegion =
         CGOpenMPRuntime::LastprivateConditionalRAII::disable(*this, S);
     emitCommonOMPParallelDirective(*this, S, OMPD_for, CodeGen,
                                    emitEmptyBoundParameters);
     if (IsInscan)
       emitScanBasedDirectiveFinals(*this, S, NumIteratorsGen);
+    if (TempsOnHeap)
+      emitScanTempArraysFree(*this, S);
   }
   // Check for outer lastprivate conditional update.
   checkForLastprivateConditionalUpdate(*this, S);
@@ -5450,14 +5494,17 @@ void CodeGenFunction::EmitOMPParallelForSimdDirective(
       return CGF.EmitScalarExpr(S.getNumIterations());
     };
     bool IsInscan = hasInscanReduction(S);
-    if (IsInscan)
-      emitScanBasedDirectiveDecls(*this, S, NumIteratorsGen);
+    OMPPrivateScope TempsScope(*this);
+    bool TempsOnHeap = IsInscan && emitScanBasedDirectiveParallelDecls(
+                                       *this, S, NumIteratorsGen, TempsScope);
     auto LPCRegion =
         CGOpenMPRuntime::LastprivateConditionalRAII::disable(*this, S);
     emitCommonOMPParallelDirective(*this, S, OMPD_for_simd, CodeGen,
                                    emitEmptyBoundParameters);
     if (IsInscan)
       emitScanBasedDirectiveFinals(*this, S, NumIteratorsGen);
+    if (TempsOnHeap)
+      emitScanTempArraysFree(*this, S);
   }
   // Check for outer lastprivate conditional update.
   checkForLastprivateConditionalUpdate(*this, S);
